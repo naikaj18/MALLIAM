@@ -4,6 +4,7 @@ from google_auth_oauthlib.flow import Flow
 from supabase_client import save_user  # Import Supabase function
 import os
 from dotenv import load_dotenv
+import jwt  # Import PyJWT
 
 load_dotenv()
 
@@ -19,7 +20,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly"
 ]
 
-# Define redirect_uri in the Flow configuration
 flow = Flow.from_client_config(
     {
         "web": {
@@ -41,7 +41,6 @@ def read_root():
 @app.get("/auth/login")
 def login():
     """Redirects user to Google OAuth Login"""
-    # Do NOT pass redirect_uri here since it's set in Flow config
     auth_url, _ = flow.authorization_url(prompt="consent")
     return RedirectResponse(auth_url)
 
@@ -59,10 +58,20 @@ def auth_callback(request: Request):
     
     credentials = flow.credentials
 
-    if not credentials.id_token or "email" not in credentials.id_token:
+    # Decode the ID token if it's a string
+    id_token = credentials.id_token
+    if isinstance(id_token, str):
+        try:
+            # Decode without verifying signature for debugging purposes
+            # (Don't do this in production without proper verification)
+            id_token = jwt.decode(id_token, options={"verify_signature": False})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to decode ID token: {str(e)}")
+
+    if "email" not in id_token:
         raise HTTPException(status_code=400, detail="Email not found in Google response")
     
-    user_email = credentials.id_token["email"]
+    user_email = id_token["email"]
 
     try:
         save_user(
