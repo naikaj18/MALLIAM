@@ -44,11 +44,13 @@ def read_root():
 @app.get("/auth/login")
 def login():
     """Redirects user to Google OAuth Login"""
+    """Redirects user to Google OAuth Login"""
     auth_url, _ = flow.authorization_url(prompt="consent")
     return RedirectResponse(auth_url)
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
+    """Handles OAuth Callback and stores credentials in Supabase"""
     """Handles OAuth Callback and stores credentials in Supabase"""
     code = request.query_params.get("code")
     if not code:
@@ -64,6 +66,7 @@ def auth_callback(request: Request):
     id_token = credentials.id_token
     if isinstance(id_token, str):
         try:
+            # Decode without verifying signature for debugging purposes
             # Decode without verifying signature for debugging purposes
             id_token = jwt.decode(id_token, options={"verify_signature": False})
         except Exception as e:
@@ -91,6 +94,10 @@ def fetch_emails(user_email: str):
     Fetches all emails from the last 24 hours for the given user,
     retrieving only key parts: Subject, From, and Snippet.
     """
+    """
+    Fetches all emails from the last 24 hours for the given user,
+    retrieving only key parts: Subject, From, and Snippet.
+    """
     user_data = get_user_credentials(user_email)
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
@@ -101,8 +108,13 @@ def fetch_emails(user_email: str):
         raise HTTPException(status_code=400, detail="Access token missing for user")
 
     # Build the Gmail service with refresh token support
+    # Build the Gmail service with refresh token support
     service = get_gmail_service(access_token, refresh_token)
     
+    messages = []
+    page_token = None
+
+    # Pagination: gather all messages from the last 24 hours
     messages = []
     page_token = None
 
@@ -121,7 +133,36 @@ def fetch_emails(user_email: str):
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
+        while True:
+            response = service.users().messages().list(
+                userId="me",
+                q="newer_than:1d",
+                pageToken=page_token
+            ).execute()
+
+            msgs = response.get("messages", [])
+            messages.extend(msgs)
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list emails: {str(e)}")
+
+    emails_data = []
+
+    # Retrieve metadata and snippet for each message
+    for msg in messages:
+        try:
+            msg_data = service.users().messages().get(
+                userId="me",
+                id=msg["id"],
+                format="metadata",
+                metadataHeaders=["Subject", "From"]
+            ).execute()
+        except Exception as e:
+            continue
+
         raise HTTPException(status_code=500, detail=f"Failed to list emails: {str(e)}")
 
     emails_data = []
@@ -163,6 +204,33 @@ def get_gmail_service(access_token: str, refresh_token: str):
         scopes=SCOPES
     )
     return build("gmail", "v1", credentials=creds)
+
+def extract_plain_text_body(payload):
+    """
+    Recursively look for a text/plain part and decode it.
+    """
+    parts = payload.get("parts")
+    if parts:
+        for part in parts:
+            mime_type = part.get("mimeType", "")
+            if mime_type == "text/plain":
+                body_data = part["body"].get("data", "")
+                return decode_base64(body_data)
+            else:
+                nested = extract_plain_text_body(part)
+                if nested:
+                    return nested
+    if payload.get("mimeType") == "text/plain":
+        body_data = payload.get("body", {}).get("data", "")
+        return decode_base64(body_data)
+    return None
+
+def decode_base64(data):
+    """Base64-url decode the given string."""
+    if not data:
+        return ""
+    decoded_bytes = base64.urlsafe_b64decode(data)
+    return decoded_bytes.decode("utf-8", errors="replace")
 
 def extract_plain_text_body(payload):
     """
