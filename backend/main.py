@@ -115,24 +115,7 @@ def fetch_emails(user_email: str):
     page_token = None
 
     # Pagination: gather all messages from the last 24 hours
-    messages = []
-    page_token = None
-
-    # Pagination: gather all messages from the last 24 hours
     try:
-        while True:
-            response = service.users().messages().list(
-                userId="me",
-                q="newer_than:1d",
-                pageToken=page_token
-            ).execute()
-
-            msgs = response.get("messages", [])
-            messages.extend(msgs)
-
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
         while True:
             response = service.users().messages().list(
                 userId="me",
@@ -163,22 +146,6 @@ def fetch_emails(user_email: str):
         except Exception as e:
             continue
 
-        raise HTTPException(status_code=500, detail=f"Failed to list emails: {str(e)}")
-
-    emails_data = []
-
-    # Retrieve metadata and snippet for each message
-    for msg in messages:
-        try:
-            msg_data = service.users().messages().get(
-                userId="me",
-                id=msg["id"],
-                format="metadata",
-                metadataHeaders=["Subject", "From"]
-            ).execute()
-        except Exception as e:
-            continue
-
         headers = msg_data.get("payload", {}).get("headers", [])
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "")
@@ -192,7 +159,7 @@ def fetch_emails(user_email: str):
 
     return classify_emails(emails_data)
 
-    # return {"emails": emails_data}
+    # return {"emails": emails_data"}
 
 def get_gmail_service(access_token: str, refresh_token: str):
     creds = Credentials(
