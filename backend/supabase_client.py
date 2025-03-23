@@ -22,3 +22,11 @@ def save_user(email, access_token, refresh_token, summary_time="08:00"):
     }
     response = supabase.table("users").insert(data).execute()
     return response
+
+def get_user_credentials(email: str):
+    """Fetch user credentials from Supabase by email."""
+    response = supabase.table("users").select("*").eq("email", email).execute()
+    # Assuming response.data contains the results.
+    if response.data:
+        return response.data[0]
+    return None
