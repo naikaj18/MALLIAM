@@ -10,6 +10,7 @@ from googleapiclient.discovery import build
 import base64
 import json
 from classifier import classify_emails
+from summarizer import openai_summary_and_reply
 import openai
 
 load_dotenv()
@@ -89,7 +90,6 @@ def auth_callback(request: Request):
             refresh_token=credentials.refresh_token
         )
     except Exception as e:
-        # If it's a duplicate entry error, we ignore it
         if "duplicate key value violates unique constraint" in str(e):
             pass
         else:
@@ -101,10 +101,11 @@ def fetch_important_full_emails(user_email: str):
     """
     1. Fetch metadata (id, subject, sender, snippet) for emails from the last 24 hours.
     2. Use the classifier to filter and return only the important email IDs.
-    3. Fetch the full email content for each important email and extract its plain-text body.
-    4. Return a JSON object with the important emails, including their subject, sender, snippet, and full_body.
+    3. For each important email, fetch the full email content and extract its plain-text body.
+    4. Then, feed the full email to the summarizer to generate a summary and suggested reply.
+    5. Return a JSON object with the important emails, including subject, sender, snippet, full_body,
+       summary, and suggested_reply.
     """
-    # Get user credentials from Supabase
     user_data = get_user_credentials(user_email)
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
@@ -158,8 +159,7 @@ def fetch_important_full_emails(user_email: str):
             "snippet": snippet
         })
     
-    # Use batch processing for classification if needed
-    emails_json_str = json.dumps(emails_data)
+    # Classify to get important email IDs
     classification_result = classify_emails(emails_data)
     if isinstance(classification_result, dict) and "error" in classification_result:
         raise HTTPException(status_code=500, detail=f"Classifier error: {classification_result['error']}")
@@ -168,43 +168,50 @@ def fetch_important_full_emails(user_email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse classification result: {str(e)}")
     
-    # Map full content for each email by ID
-    full_content_map = {}
-    for msg in messages:
-        try:
-            full_msg = service.users().messages().get(
-                userId="me",
-                id=msg["id"],
-                format="full"
-            ).execute()
-            full_content_map[msg["id"]] = full_msg
-        except Exception:
-            continue
-    
-    important_full_emails = []
+    # Fetch full email content for each important email
+    important_emails = []
     for email_id in important_ids:
         meta = next((x for x in emails_data if x["id"] == email_id), None)
         if not meta:
             continue
-        full_msg = full_content_map.get(email_id)
-        if not full_msg:
+        try:
+            full_msg = service.users().messages().get(
+                userId="me",
+                id=email_id,
+                format="full"
+            ).execute()
+        except Exception:
             continue
         headers = full_msg.get("payload", {}).get("headers", [])
-        subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), "")
-        sender = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
-        plain_text_body = extract_plain_text_body(full_msg.get("payload", {}))
-        # Optionally truncate long body content
-        if plain_text_body and len(plain_text_body) > 500:
-            plain_text_body = plain_text_body[:500] + "..."
-        important_full_emails.append({
+        subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), meta.get("subject"))
+        sender = next((h["value"] for h in headers if h["name"].lower() == "from"), meta.get("sender"))
+        full_body = extract_plain_text_body(full_msg.get("payload", {}))
+        # Optionally, truncate the full body if needed
+        if full_body and len(full_body) > 500:
+            full_body = full_body[:500] + "..."
+        
+        # Prepare input for summarizer: construct a dict that mimics expected structure
+        summarizer_input = {
+            "subject": subject,
+            "sender": sender,
+            "payload": {"body": {"data": full_body}}
+        }
+        summary_reply = openai_summary_and_reply(summarizer_input)
+        try:
+            summary_reply_parsed = json.loads(summary_reply)
+        except Exception:
+            summary_reply_parsed = {"summary": summary_reply, "suggested_reply": ""}
+        
+        important_emails.append({
             "id": email_id,
             "subject": subject,
             "sender": sender,
             "snippet": meta.get("snippet"),
-            "full_body": plain_text_body
+            "full_body": full_body,
+            "summary_info": summary_reply_parsed
         })
     
-    return JSONResponse(content={"important_emails": important_full_emails})
+    return JSONResponse(content={"important_emails": important_emails})
 
 def get_gmail_service(access_token: str, refresh_token: str):
     creds = Credentials(
@@ -242,9 +249,9 @@ def decode_base64(data):
 
 def openai_summary_and_reply(email_content):
     """
-    Given an email content dictionary with keys "subject", "sender", and a body (in email_content['payload']['body']['data']),
-    this function uses the LLM to generate a summary and a suggested reply.
-    The function returns the LLM's JSON response with keys "summary" and "suggested_reply".
+    Given an email content dictionary with keys "subject", "sender", and a body in email_content['payload']['body']['data'],
+    this function uses the LLM to generate a concise summary and a suggested professional reply.
+    It returns the LLM's response as a string.
     """
     subject = email_content.get("subject", "")
     sender = email_content.get("sender", "")
@@ -252,13 +259,12 @@ def openai_summary_and_reply(email_content):
     if body and len(body) > 500:
         body = body[:500] + "..."
     
-    # You can adjust the tone and details of the prompt as needed
     prompt = (
         f"Subject: {subject}\nSender: {sender}\nBody: {body}\n\n"
-        "Please provide a concise summary of this email and suggest a professional reply. "
+        "Please provide a concise summary of the email and suggest a professional reply. "
         "Return your result as a valid JSON object with two keys: 'summary' and 'suggested_reply'."
     )
-
+    
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}],
