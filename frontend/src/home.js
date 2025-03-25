@@ -16,12 +16,18 @@ function Home() {
 
   const fetchSummaries = async (userEmail) => {
     try {
-      const res = await fetch(`http://localhost:8000/emails?user_email=${userEmail}`);
+      const res = await fetch(`http://localhost:8000/emails/actions?user_email=${userEmail}`);
       const data = await res.json();
-      if (Array.isArray(data)) setEmailSummaries(data);
-      else console.error("Unexpected summary format", data);
+  
+      console.log("Fetched email summaries:", data); // ADD THIS LINE
+  
+      if (Array.isArray(data.emails)) {
+        setEmailSummaries(data.emails);
+      } else {
+        console.error("Unexpected response format:", data);
+      }
     } catch (err) {
-      console.error("Failed to fetch emails", err);
+      console.error("Failed to fetch email summaries", err);
     }
   };
 
@@ -63,17 +69,35 @@ function Home() {
           </div>
         </div>
 
+        <div className="border dark:border-gray-700 rounded-xl p-6 shadow-sm bg-gray-50 dark:bg-gray-800 space-y-4">
+          <h2 className="text-xl font-semibold">📨 Send Summary Immediately</h2>
+          <button
+            onClick={async () => {
+              try {
+                await fetch("http://localhost:8000/send-summary-now", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ email }),
+                });
+                alert("Summary email sent!");
+              } catch (err) {
+                console.error("Failed to send summary now", err);
+                alert("Failed to send summary. Please try again.");
+              }
+            }}
+            className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded transition"
+          >
+            Send Summary Now
+          </button>
+        </div>
+
         <div className="space-y-6">
           <h2 className="text-xl font-semibold">📬 Recent Important Emails</h2>
           {emailSummaries.length > 0 ? (
             <ul className="space-y-4">
-              {emailSummaries.map((email, idx) => (
+              {emailSummaries.map((item, idx) => (
                 <li key={idx} className="border-b pb-4 dark:border-gray-700">
-                  <div className="font-medium">{email.subject}</div>
-                  <div className="text-sm text-gray-500 dark:text-gray-400">
-                    From: {email.sender}
-                  </div>
-                  <div className="text-sm mt-1">{email.snippet}</div>
+                  <div className="font-medium whitespace-pre-wrap">{item.summary}</div>
                 </li>
               ))}
             </ul>

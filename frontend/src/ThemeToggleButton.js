@@ -2,25 +2,49 @@ import { useEffect, useState } from "react";
 
 function ThemeToggleButton() {
   const [isDark, setIsDark] = useState(false);
+  const currentPath = window.location.pathname;
 
   useEffect(() => {
     const root = window.document.documentElement;
-    if (isDark) {
+    const storedTheme = localStorage.getItem("theme");
+    if (storedTheme === "dark") {
       root.classList.add("dark");
-    } else {
-      root.classList.remove("dark");
+      setIsDark(true);
     }
-  }, [isDark]);
+  }, []);
+
+  const toggleTheme = () => {
+    const root = window.document.documentElement;
+    if (isDark) {
+      root.classList.remove("dark");
+      localStorage.setItem("theme", "light");
+    } else {
+      root.classList.add("dark");
+      localStorage.setItem("theme", "dark");
+    }
+    setIsDark(!isDark);
+  };
+
+  if (currentPath === "/") return null;
 
   return (
-    <div className="p-4 text-right transition-opacity duration-500 ease-in-out opacity-100">
+    <div className="absolute top-4 right-4 flex space-x-3 z-50">
       <button
-        onClick={() => setIsDark(!isDark)}
-        className={`px-4 py-2 rounded bg-accentBlue text-white transition-colors duration-500 ease-in-out ${
-          isDark ? "hover:bg-yellow-500" : "hover:bg-blue-700"
-        }`}
+        onClick={toggleTheme}
+        className="p-2 rounded-full bg-gray-200 dark:bg-gray-700 text-black dark:text-white shadow-md hover:scale-105 transition"
+        title="Toggle Theme"
       >
-        {isDark ? "☀️ Light Mode" : "🌙 Dark Mode"}
+        {isDark ? "☀️" : "🌙"}
+      </button>
+      <button
+        onClick={() => {
+          localStorage.clear();
+          window.location.href = "/";
+        }}
+        className="p-2 rounded-full bg-red-500 text-white shadow-md hover:bg-red-600 transition"
+        title="Logout"
+      >
+        ⎋
       </button>
     </div>
   );

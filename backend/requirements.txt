@@ -39,7 +39,7 @@ pydantic==2.10.6
 pydantic_core==2.27.2
 PyJWT==2.10.1
 pyparsing==3.2.1
-openai
+openai==0.28
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 realtime==2.4.1
