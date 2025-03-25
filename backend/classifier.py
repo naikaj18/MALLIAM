@@ -4,80 +4,73 @@ from dotenv import load_dotenv
 import json
 
 load_dotenv()
-
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def classify_emails(emails_json):
+def classify_emails(emails_json, batch_size=10):
     """
-    Sends a list of email JSON objects to OpenAI for classification.
-    Returns the classification result.
-    """
-    # Truncate individual fields to reduce overall token count
-    for email in emails_json:
-        if 'subject' in email and email['subject']:
-            email['subject'] = email['subject'][:100] + "..." if len(email['subject']) > 100 else email['subject']
-        if 'sender' in email and email['sender']:
-            email['sender'] = email['sender'][:100] + "..." if len(email['sender']) > 100 else email['sender']
-        if 'snippet' in email and email['snippet']:
-            email['snippet'] = email['snippet'][:200] + "..." if len(email['snippet']) > 200 else email['snippet']
+    Processes the list of emails in batches to avoid exceeding the model's context length.
+    For each batch, it sends a JSON array of emails to OpenAI with a strict prompt.
     
-    emails_str = f"{emails_json}"
-    # Reduce the maximum allowed size from 500000 to 300000 characters
-    max_allowed = 300000
-    if len(emails_str) > max_allowed:
-        allowed_emails = []
-        for email in emails_json:
-            allowed_emails.append(email)
-            if len(f"{allowed_emails}") > max_allowed:
-                allowed_emails.pop()
-                break
-        emails_json = allowed_emails
+    The prompt instructs the LLM to:
+      - Exclude any emails that are automated, promotional, or marketing in nature.
+      - Exclude job alerts (e.g., from LinkedIn Job Alerts, ZipRecruiter, etc.), career notifications, 
+        subscription newsletters, daily digests, and any emails offering discounts, deals, or offers.
+      - Return only the IDs of emails that are genuine personal or work-related communications requiring direct attention or action.
+    
+    Aggregates and returns all important email IDs as a JSON array string.
+    """
+    important_ids = []
+    
+    # Process emails in batches
+    for i in range(0, len(emails_json), batch_size):
+        batch = emails_json[i:i+batch_size]
         
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini-2024-07-18",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You're an intelligent email filter assistant. You are given a JSON array of emails, where each email includes the fields \"id\", \"subject\", \"sender\", and \"snippet\". Your task is to analyze each email and determine whether it requires the user's direct reply or manual action—such as scheduling interviews, replying to a personal or business inquiry, or acknowledging a critical update. Exclude from your output only those emails that are clearly advertisements, job ads, or sent from talent networks. If an email is ambiguous or does not clearly fall into one of these excluded categories, include it in your output. For each included email, include all the original fields and add a new field \"action_required\", which should be set to true if the email requires a reply, or false otherwise. Additionally, remove any occurrences of the sequence \"\\u200c\" from the JSON output. Please output the classification for every email provided (excluding only those emails that clearly match the excluded categories). Return your output as a JSON array of emails, with each email including: \"id\", \"subject\", \"sender\", \"snippet\", and \"action_required\". If no emails are classified as important, output a JSON object with a field \"message\" stating \"There are no important emails\". Output only the JSON without any extra commentary."
-                },
-                {
-                    "role": "user",
-                    "content": f"Here are the emails: {emails_json}"
-                }
-            ],
-            temperature=0.3
-        )
-        content = response['choices'][0]['message']['content']
-        if not content.strip():
-            return {"error": "Empty response from OpenAI"}
+        # Truncate fields to reduce token usage
+        for email in batch:
+            if 'subject' in email and email['subject']:
+                email['subject'] = email['subject'][:50] + "..." if len(email['subject']) > 50 else email['subject']
+            if 'sender' in email and email['sender']:
+                email['sender'] = email['sender'][:50] + "..." if len(email['sender']) > 50 else email['sender']
+            if 'snippet' in email and email['snippet']:
+                email['snippet'] = email['snippet'][:100] + "..." if len(email['snippet']) > 100 else email['snippet']
+        
+        batch_json_str = json.dumps(batch)
+        
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",  # Change model as needed
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a no-nonsense email filter assistant. You are given a JSON array of emails, "
+                            "where each email includes the fields 'id', 'subject', 'sender', and 'snippet'. "
+                            "Your task is to output only a valid JSON array of the IDs of emails that are truly important. "
+                            "Important emails are those that represent genuine personal or work-related communications requiring direct attention or action. "
+                            "Strictly exclude any emails that are automated, promotional, or marketing in nature. "
+                            "This includes, but is not limited to, emails that are job alerts (e.g. from LinkedIn, ZipRecruiter, or similar), "
+                            "career notifications, subscription newsletters, daily digests, and emails offering discounts, deals, or offers. "
+                            "Return only a valid JSON array of email IDs with no extra commentary."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Here are the emails: {batch_json_str}"
+                    }
+                ],
+                temperature=0.3
+            )
+            content = response['choices'][0]['message']['content']
+            if not content.strip():
+                continue
+            # Remove markdown code fences if present
+            if content.strip().startswith("```"):
+                content = content.strip().strip("`").strip("json").strip()
+            batch_ids = json.loads(content)
+            if isinstance(batch_ids, list):
+                important_ids.extend(batch_ids)
+        except Exception as e:
+            print(f"Batch starting at index {i} error: {e}")
+            continue
 
-        # Strip markdown formatting if present
-        if content.strip().startswith("```"):
-            content = content.strip().strip("`").strip("json").strip()
-        parsed = json.loads(content)
-        return json.dumps(parsed, indent=4)
-    except Exception as e:
-        return {"error": str(e)}
-
-def openai_summary_and_reply(email_content):
-    subject = email_content.get("subject")
-    sender = email_content.get("sender")
-    body = email_content.get("body")
-    if body and len(body) > 500:
-        body = body[:500] + "..."
-    
-    prompt = (
-        f"Please summarize the following email and provide a separate suggested reply. "
-        f"Output the result as JSON with two keys: 'summary' and 'suggested_reply', with no additional commentary.\n\n"
-        f"Subject: {subject}\nSender: {sender}\nBody: {body}"
-    )
-    
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini-2024-07-18",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5
-    )
-    
-    summary_and_reply = response['choices'][0]['message']['content']
-    return summary_and_reply
+    return json.dumps(important_ids, indent=4)
