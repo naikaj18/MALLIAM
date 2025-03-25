@@ -12,6 +12,19 @@ from classifier import classify_emails
 load_dotenv()
 
 app = FastAPI()
+from fastapi.middleware.cors import CORSMiddleware
+
+origins = [
+    "http://localhost:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -51,30 +64,27 @@ def login():
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     """Handles OAuth Callback and stores credentials in Supabase"""
-    """Handles OAuth Callback and stores credentials in Supabase"""
     code = request.query_params.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="Authorization code not found")
+
     try:
         flow.fetch_token(code=code)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Token exchange failed: {str(e)}")
     
     credentials = flow.credentials
-
-    # Decode the ID token if it's a string
     id_token = credentials.id_token
+
     if isinstance(id_token, str):
         try:
-            # Decode without verifying signature for debugging purposes
-            # Decode without verifying signature for debugging purposes
             id_token = jwt.decode(id_token, options={"verify_signature": False})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to decode ID token: {str(e)}")
 
     if "email" not in id_token:
         raise HTTPException(status_code=400, detail="Email not found in Google response")
-    
+
     user_email = id_token["email"]
 
     try:
@@ -84,9 +94,13 @@ def auth_callback(request: Request):
             refresh_token=credentials.refresh_token
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save user: {str(e)}")
+        if "duplicate key value violates unique constraint" in str(e):
+            # User already exists; that's okay—continue to homepage
+            pass
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to save user: {str(e)}")
 
-    return {"message": f"User {user_email} logged in & credentials stored in Supabase"}
+    return RedirectResponse(url=f"http://localhost:3000/home?email={user_email}")
 
 @app.get("/emails")
 def fetch_emails(user_email: str):
