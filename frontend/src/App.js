@@ -1,21 +1,7 @@
-import React, { useEffect, useState } from "react";
+import Login from "./Login";
 
 function App() {
-  const [message, setMessage] = useState("");
-
-  useEffect(() => {
-    fetch("http://127.0.0.1:8000/")
-      .then((res) => res.json())
-      .then((data) => setMessage(data.message))
-      .catch((err) => console.error("Error:", err));
-  }, []);
-
-  return (
-    <div>
-      <h1>Mailliam – AI Email Summarizer</h1>
-      <h2>{message}</h2>
-    </div>
-  );
+  return <Login />;
 }
 
 export default App;
