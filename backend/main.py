@@ -8,7 +8,9 @@ import jwt
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import base64
+import json
 from classifier import classify_emails
+from summarizer import openai_summary_and_reply
 import openai
 import json
 from sentence_transformers import SentenceTransformer
@@ -17,15 +19,16 @@ import faiss
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 
+
 load_dotenv()
 
 app = FastAPI()
-from fastapi.middleware.cors import CORSMiddleware
 
+# Enable CORS for your frontend
+from fastapi.middleware.cors import CORSMiddleware
 origins = [
     "http://localhost:3000",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -144,7 +147,6 @@ def auth_callback(request: Request):
     code = request.query_params.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="Authorization code not found")
-
     try:
         flow.fetch_token(code=code)
     except Exception as e:
@@ -152,18 +154,14 @@ def auth_callback(request: Request):
     
     credentials = flow.credentials
     id_token = credentials.id_token
-
     if isinstance(id_token, str):
         try:
             id_token = jwt.decode(id_token, options={"verify_signature": False})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to decode ID token: {str(e)}")
-
     if "email" not in id_token:
         raise HTTPException(status_code=400, detail="Email not found in Google response")
-
     user_email = id_token["email"]
-
     try:
         save_user(
             email=user_email,
@@ -175,24 +173,32 @@ def auth_callback(request: Request):
             pass
         else:
             raise HTTPException(status_code=500, detail=f"Failed to save user: {str(e)}")
-
     return RedirectResponse(url=f"http://localhost:3000/home?email={user_email}")
 
-@app.get("/emails/actions")
-def email_actions(user_email: str):
+@app.get("/emails/important_full")
+def fetch_important_full_emails(user_email: str):
+    """
+    1. Fetch metadata (id, subject, sender, snippet) for emails from the last 24 hours.
+    2. Use the classifier to filter and return only the important email IDs.
+    3. For each important email, fetch the full email content and extract its plain-text body.
+    4. Then, feed the full email to the summarizer to generate a summary and suggested reply.
+    5. Return a JSON object with the important emails, including subject, sender, snippet, full_body,
+       summary, and suggested_reply.
+    """
     user_data = get_user_credentials(user_email)
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
-
     access_token = user_data.get("access_token")
     refresh_token = user_data.get("refresh_token")
     if not access_token:
         raise HTTPException(status_code=400, detail="Access token missing for user")
-
+    
     service = get_gmail_service(access_token, refresh_token)
+    
     messages = []
     page_token = None
     max_emails = 100
+
 
     try:
         while True:
@@ -201,14 +207,11 @@ def email_actions(user_email: str):
                 q="newer_than:1d",
                 pageToken=page_token
             ).execute()
-
             msgs = response.get("messages", [])
             messages.extend(msgs)
-
             if len(messages) >= max_emails:
                 messages = messages[:max_emails]
                 break
-
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
@@ -217,19 +220,20 @@ def email_actions(user_email: str):
 
     # Process emails_data to extract needed fields and build a list for embedding
     emails_data_for_embedding = []
+
     for msg in messages:
         try:
             msg_data = service.users().messages().get(
                 userId="me",
                 id=msg["id"],
-                format="full"
+                format="metadata",
+                metadataHeaders=["Subject", "From"]
             ).execute()
         except Exception:
             continue
-
         headers = msg_data.get("payload", {}).get("headers", [])
-        subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
-        sender = next((h["value"] for h in headers if h["name"] == "From"), "")
+        subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), "")
+        sender = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
         snippet = msg_data.get("snippet", "")
         body = extract_plain_text_body(msg_data.get("payload"))
 
@@ -300,9 +304,9 @@ def email_actions(user_email: str):
 
         summary_reply = openai_summary_and_reply(aggregated_email_content, user_email)
 
+
         try:
-            parsed_output = json.loads(summary_reply)
-            result = parsed_output[0] if isinstance(parsed_output, list) else parsed_output
+            summary_reply_parsed = json.loads(summary_reply)
         except Exception:
             result = {"summary": summary_reply, "suggested_reply": ""}
 
@@ -328,6 +332,7 @@ def email_actions(user_email: str):
         results.append(result)
 
     return JSONResponse(content={"emails": results})
+
 
 def get_gmail_service(access_token: str, refresh_token: str):
     creds = Credentials(
@@ -363,28 +368,32 @@ def decode_base64(data):
     decoded_bytes = base64.urlsafe_b64decode(data)
     return decoded_bytes.decode("utf-8", errors="replace")
 
-def openai_summary_and_reply(email_content, user_email):
-    user_data = get_user_credentials(user_email)
-    access_token = user_data.get("access_token")
-    refresh_token = user_data.get("refresh_token")
-    my_name = get_user_profile(access_token, refresh_token)
-
-    subject = email_content.get("subject")
-    sender = email_content.get("sender")
-    tone = "professional"
-    plain_text_body = email_content['payload']['body']['data']
+def openai_summary_and_reply(email_content):
+    """
+    Given an email content dictionary with keys "subject", "sender", and a body in email_content['payload']['body']['data'],
+    this function uses the LLM to generate a concise summary and a suggested professional reply.
+    It returns the LLM's response as a string.
+    """
+    subject = email_content.get("subject", "")
+    sender = email_content.get("sender", "")
+    body = email_content.get("payload", {}).get("body", {}).get("data", "")
+    if body and len(body) > 500:
+        body = body[:500] + "..."
+    
     prompt = (
         f"Subject: {subject}\nSender: {sender}\nBody: {plain_text_body}\n\n"
         f"Please summarize the above email for me and suggest a reply {tone} way. "
         f"In summary don't say recipient, instead say you or something from third person perspective. "
         f"Add best regards with {my_name} in the last in the suggested reply. never give [Your Name] in the suggested reply. "
-    )
 
+    )
+    
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.5
     )
-
+    
     return response.choices[0].message['content']
 
 def get_user_profile(access_token: str, refresh_token: str):
@@ -396,15 +405,12 @@ def get_user_profile(access_token: str, refresh_token: str):
         client_secret=CLIENT_SECRET,
         scopes=["https://www.googleapis.com/auth/userinfo.profile"]
     )
-
     people_service = build("people", "v1", credentials=creds)
     profile = people_service.people().get(
         resourceName="people/me",
         personFields="names,emailAddresses"
     ).execute()
-
     display_name = None
     if "names" in profile and profile["names"]:
         display_name = profile["names"][0].get("displayName")
-
     return display_name
