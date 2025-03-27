@@ -98,7 +98,10 @@ function Home() {
               {emailSummaries.map((item, idx) => (
                 <li key={idx} className="border-b pb-4 dark:border-gray-700">
                   <div className="font-medium whitespace-pre-wrap">{item.summary}</div>
+                  <div className="text-sm text-gray-500 dark:text-gray-400">{item.suggested_reply}</div>
                 </li>
+
+                
               ))}
             </ul>
           ) : (

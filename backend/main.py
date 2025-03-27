@@ -12,6 +12,13 @@ import json
 from classifier import classify_emails
 from summarizer import openai_summary_and_reply
 import openai
+import json
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import faiss
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+
 
 load_dotenv()
 
@@ -53,6 +60,78 @@ flow = Flow.from_client_config(
     scopes=SCOPES,
     redirect_uri=REDIRECT_URI
 )
+
+# Initialize the embedding model
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+def encode_email(email):
+    """
+    Encodes an email into an embedding vector using its subject, sender, and body.
+    """
+    text = f"Subject: {email.get('subject', '')}\nSender: {email.get('sender', '')}\nBody: {email.get('body', '')}"
+    return embedder.encode(text, convert_to_numpy=True)
+
+
+def build_vector_index(emails):
+    """
+    Build a FAISS index from the list of emails and return the index and corresponding email ids.
+    """
+    embeddings = []
+    email_ids = []
+    for email in emails:
+        emb = encode_email(email)
+        embeddings.append(emb)
+        email_ids.append(email['id'])
+    embeddings = np.stack(embeddings)
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(embeddings, dtype=np.float32))
+    return index, email_ids
+
+
+def retrieve_relevant_emails(query, index, emails, email_ids, top_k=5):
+    """
+    Retrieves the top_k most relevant emails from the FAISS index based on the query.
+    """
+    query_embedding = embedder.encode([query], convert_to_numpy=True)
+    query_embedding = np.array(query_embedding, dtype=np.float32)
+    distances, indices = index.search(query_embedding, top_k)
+    retrieved = []
+    for idx in indices[0]:
+        if idx < len(emails):
+            retrieved.append(emails[idx])
+    return retrieved
+
+
+def prepare_context_from_emails(emails):
+    """
+    Aggregates a list of emails into a single context string.
+    """
+    context = ""
+    for email in emails:
+        context += f"Subject: {email.get('subject', '')}\n"
+        context += f"From: {email.get('sender', '')}\n"
+        context += f"Body: {email.get('body', '')}\n\n"
+    return context
+
+
+def generate_reply_with_context(aggregated_context, user_email, my_name):
+    """
+    Generates a reply using the aggregated context from multiple emails.
+    """
+    prompt = (
+        f"Below are some emails:\n\n{aggregated_context}\n\n"
+        f"Based on these emails, please generate a professional summary and a suggested reply. "
+        f"Do not mention that these are aggregated emails. The reply should end with 'Best regards, {my_name}'."
+    )
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.5
+    )
+    return response.choices[0].message['content']
+
 
 @app.get("/")
 def read_root():
@@ -118,7 +197,9 @@ def fetch_important_full_emails(user_email: str):
     
     messages = []
     page_token = None
-    max_emails = 50
+    max_emails = 100
+
+
     try:
         while True:
             response = service.users().messages().list(
@@ -136,8 +217,10 @@ def fetch_important_full_emails(user_email: str):
                 break
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list emails: {str(e)}")
-    
-    emails_data = []
+
+    # Process emails_data to extract needed fields and build a list for embedding
+    emails_data_for_embedding = []
+
     for msg in messages:
         try:
             msg_data = service.users().messages().get(
@@ -152,66 +235,104 @@ def fetch_important_full_emails(user_email: str):
         subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), "")
         sender = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
         snippet = msg_data.get("snippet", "")
-        emails_data.append({
+        body = extract_plain_text_body(msg_data.get("payload"))
+
+        emails_data_for_embedding.append({
             "id": msg["id"],
             "subject": subject,
             "sender": sender,
-            "snippet": snippet
+            "snippet": snippet,
+            "body": body,
+            "full_content": msg_data
         })
-    
-    # Classify to get important email IDs
-    classification_result = classify_emails(emails_data)
-    if isinstance(classification_result, dict) and "error" in classification_result:
-        raise HTTPException(status_code=500, detail=f"Classifier error: {classification_result['error']}")
-    try:
-        important_ids = json.loads(classification_result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse classification result: {str(e)}")
-    
-    # Fetch full email content for each important email
-    important_emails = []
-    for email_id in important_ids:
-        meta = next((x for x in emails_data if x["id"] == email_id), None)
-        if not meta:
-            continue
-        try:
-            full_msg = service.users().messages().get(
-                userId="me",
-                id=email_id,
-                format="full"
-            ).execute()
-        except Exception:
-            continue
-        headers = full_msg.get("payload", {}).get("headers", [])
-        subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), meta.get("subject"))
-        sender = next((h["value"] for h in headers if h["name"].lower() == "from"), meta.get("sender"))
-        full_body = extract_plain_text_body(full_msg.get("payload", {}))
-        # Optionally, truncate the full body if needed
-        if full_body and len(full_body) > 500:
-            full_body = full_body[:500] + "..."
+
+    # Build the FAISS vector index from the emails
+    index, email_ids = build_vector_index(emails_data_for_embedding)
+
+    # Define a query for retrieval; you can modify this as needed
+    query = "Generate a reply based on the recent emails"
+    relevant_emails = retrieve_relevant_emails(query, index, emails_data_for_embedding, email_ids, top_k=5)
+
+    # Retrieve the user's display name
+    my_name = get_user_profile(access_token, refresh_token)
+
+    # Step 1: Group emails by sender
+    sender_groups = defaultdict(list)
+    sender_embeddings = defaultdict(list)
+
+    for email in relevant_emails:
+        sender = email.get("sender", "")
+        sender_groups[sender].append(email)
+        sender_embeddings[sender].append(encode_email(email))
+
+    # Step 2: Cluster emails from same sender using cosine similarity
+    semantic_groups = []
+    for sender, emails in sender_groups.items():
+        embeddings = sender_embeddings[sender]
+        used = set()
+
+        for i in range(len(emails)):
+            if i in used:
+                continue
+            group = [emails[i]]
+            used.add(i)
+            for j in range(i + 1, len(emails)):
+                if j in used:
+                    continue
+                sim = cosine_similarity([embeddings[i]], [embeddings[j]])[0][0]
+                if sim > 0.75:
+                    group.append(emails[j])
+                    used.add(j)
+            semantic_groups.append(group)
+
+    # Step 3: Process each semantic group
+    results = []
+    for group_emails in semantic_groups:
+        sender = group_emails[0].get("sender", "")
+        representative_subject = group_emails[0].get("subject", "")
+        aggregated_body = "\n\n".join([email.get("body") or "" for email in group_emails])
         
-        # Prepare input for summarizer: construct a dict that mimics expected structure
-        summarizer_input = {
-            "subject": subject,
+        aggregated_email_content = {
+            "subject": representative_subject,
             "sender": sender,
-            "payload": {"body": {"data": full_body}}
+            "payload": {
+                "body": {
+                    "data": aggregated_body
+                }
+            }
         }
-        summary_reply = openai_summary_and_reply(summarizer_input)
+
+        summary_reply = openai_summary_and_reply(aggregated_email_content, user_email)
+
+
         try:
             summary_reply_parsed = json.loads(summary_reply)
         except Exception:
-            summary_reply_parsed = {"summary": summary_reply, "suggested_reply": ""}
-        
-        important_emails.append({
-            "id": email_id,
-            "subject": subject,
+            result = {"summary": summary_reply, "suggested_reply": ""}
+
+        result["group"] = {
             "sender": sender,
-            "snippet": meta.get("snippet"),
-            "full_body": full_body,
-            "summary_info": summary_reply_parsed
-        })
-    
-    return JSONResponse(content={"important_emails": important_emails})
+            "subject": representative_subject,
+            "email_ids": [email.get("id") for email in group_emails]
+        }
+        result["email_id"] = group_emails[0].get("id")
+
+        if not result.get("suggested_reply"):
+            summary_text = result.get("summary", "")
+            marker = None
+            if "Suggested reply:" in summary_text:
+                marker = "Suggested reply:"
+            elif "Reply suggestion:" in summary_text:
+                marker = "Reply suggestion:"
+            if marker:
+                parts = summary_text.split(marker)
+                result["summary"] = parts[0].strip()
+                result["suggested_reply"] = parts[1].strip() if len(parts) > 1 else ""
+
+        results.append(result)
+
+    return JSONResponse(content={"emails": results})
+
 
 def get_gmail_service(access_token: str, refresh_token: str):
     creds = Credentials(
@@ -260,9 +381,11 @@ def openai_summary_and_reply(email_content):
         body = body[:500] + "..."
     
     prompt = (
-        f"Subject: {subject}\nSender: {sender}\nBody: {body}\n\n"
-        "Please provide a concise summary of the email and suggest a professional reply. "
-        "Return your result as a valid JSON object with two keys: 'summary' and 'suggested_reply'."
+        f"Subject: {subject}\nSender: {sender}\nBody: {plain_text_body}\n\n"
+        f"Please summarize the above email for me and suggest a reply {tone} way. "
+        f"In summary don't say recipient, instead say you or something from third person perspective. "
+        f"Add best regards with {my_name} in the last in the suggested reply. never give [Your Name] in the suggested reply. "
+
     )
     
     response = openai.ChatCompletion.create(
