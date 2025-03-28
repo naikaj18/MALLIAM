@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from starlette.responses import RedirectResponse, JSONResponse
+from starlette.responses import RedirectResponse, JSONResponse, PlainTextResponse
 from google_auth_oauthlib.flow import Flow
 from supabase_client import save_user, get_user_credentials
 import os
@@ -10,7 +10,8 @@ from googleapiclient.discovery import build
 import base64
 import json
 from classifier import classify_emails
-from summarizer import openai_summary_and_reply  # <--- We only use the summarizer from summarizer.py
+from summarizer import openai_summary_and_reply  # Use summarizer from summarizer.py
+from group_emails import group_emails_by_llm
 import openai
 import numpy as np
 import faiss
@@ -61,19 +62,11 @@ flow = Flow.from_client_config(
 # Initialize the embedding model
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
-
 def encode_email(email):
-    """
-    Encodes an email into an embedding vector using its subject, sender, and body.
-    """
     text = f"Subject: {email.get('subject', '')}\nSender: {email.get('sender', '')}\nBody: {email.get('body', '')}"
     return embedder.encode(text, convert_to_numpy=True)
 
-
 def build_vector_index(emails):
-    """
-    Build a FAISS index from the list of emails and return the index and corresponding email ids.
-    """
     embeddings = []
     email_ids = []
     for email in emails:
@@ -86,11 +79,7 @@ def build_vector_index(emails):
     index.add(np.array(embeddings, dtype=np.float32))
     return index, email_ids
 
-
 def retrieve_relevant_emails(query, index, emails, email_ids, top_k=5):
-    """
-    Retrieves the top_k most relevant emails from the FAISS index based on the query.
-    """
     query_embedding = embedder.encode([query], convert_to_numpy=True)
     query_embedding = np.array(query_embedding, dtype=np.float32)
     distances, indices = index.search(query_embedding, top_k)
@@ -100,11 +89,7 @@ def retrieve_relevant_emails(query, index, emails, email_ids, top_k=5):
             retrieved.append(emails[idx])
     return retrieved
 
-
 def prepare_context_from_emails(emails):
-    """
-    Aggregates a list of emails into a single context string.
-    """
     context = ""
     for email in emails:
         context += f"Subject: {email.get('subject', '')}\n"
@@ -112,15 +97,11 @@ def prepare_context_from_emails(emails):
         context += f"Body: {email.get('body', '')}\n\n"
     return context
 
-
 def generate_reply_with_context(aggregated_context):
-    """
-    Generates a reply using the aggregated context from multiple emails.
-    """
     prompt = (
         f"Below are some emails:\n\n{aggregated_context}\n\n"
-        f"Based on these emails, please generate a professional summary and a suggested reply. "
-        f"Do not mention that these are aggregated emails. The reply should end with 'Best regards, <Your Name>'."
+        "Based on these emails, please generate a professional summary and a suggested reply. "
+        "Do not mention that these are aggregated emails. The reply should end with 'Best regards, <Your Name>'."
     )
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
@@ -129,17 +110,14 @@ def generate_reply_with_context(aggregated_context):
     )
     return response.choices[0].message['content']
 
-
 @app.get("/")
 def read_root():
     return {"message": "Welcome to Mailliam!"}
-
 
 @app.get("/auth/login")
 def login():
     auth_url, _ = flow.authorization_url(prompt="consent")
     return RedirectResponse(auth_url)
-
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
@@ -174,18 +152,8 @@ def auth_callback(request: Request):
             raise HTTPException(status_code=500, detail=f"Failed to save user: {str(e)}")
     return RedirectResponse(url=f"http://localhost:3000/home?email={user_email}")
 
-
 @app.get("/emails/important_full")
 def fetch_important_full_emails(user_email: str):
-    """
-    1. Fetch metadata (id, subject, sender, snippet, labelIds) for all emails from the last 24 hours.
-    2. Identify emails flagged as IMPORTANT by Gmail.
-    3. Use the classifier to further filter the emails based on custom criteria.
-    4. Take the union of both sets of email IDs.
-    5. For each important email, fetch the full email content and extract its plain-text body.
-    6. Then, feed the full email to the summarizer to generate a summary and suggested reply.
-    7. Return a JSON object with the important emails, including subject, sender, snippet, full_body, summary, and suggested_reply.
-    """
     user_data = get_user_credentials(user_email)
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
@@ -195,12 +163,10 @@ def fetch_important_full_emails(user_email: str):
         raise HTTPException(status_code=400, detail="Access token missing for user")
     
     service = get_gmail_service(access_token, refresh_token)
-    
     messages = []
     page_token = None
     max_emails = 100
 
-    # Fetch all emails from the last day
     try:
         while True:
             response = service.users().messages().list(
@@ -222,7 +188,6 @@ def fetch_important_full_emails(user_email: str):
     emails_data = []
     gmail_important_ids = set()
 
-    # Fetch metadata and also capture Gmail flagged important emails
     for msg in messages:
         try:
             msg_data = service.users().messages().get(
@@ -238,10 +203,8 @@ def fetch_important_full_emails(user_email: str):
         sender = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
         snippet = msg_data.get("snippet", "")
         label_ids = msg_data.get("labelIds", [])
-        # If Gmail flagged this email as important, add it
         if "IMPORTANT" in label_ids:
             gmail_important_ids.add(msg["id"])
-        # Optionally, also try to extract a preview of the body (if available) for classification
         body_preview = extract_plain_text_body(msg_data.get("payload", {}))
         emails_data.append({
             "id": msg["id"],
@@ -251,20 +214,15 @@ def fetch_important_full_emails(user_email: str):
             "body": body_preview
         })
 
-    # Run classifier on all fetched emails to get custom important email IDs
     classifier_result = classify_emails(emails_data)
     try:
         classifier_ids = set(json.loads(classifier_result))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse classification result: {str(e)}")
     
-    # Combine the sets: include emails flagged as important by Gmail and by classifier
     important_ids = list(gmail_important_ids.union(classifier_ids))
-    
-    # Now, fetch the full content for each important email
     important_emails = []
     for email_id in important_ids:
-        # Find metadata for display purposes
         meta = next((x for x in emails_data if x["id"] == email_id), None)
         if not meta:
             continue
@@ -283,16 +241,12 @@ def fetch_important_full_emails(user_email: str):
         if full_body and len(full_body) > 500:
             full_body = full_body[:500] + "..."
         
-        # Prepare input for summarizer
         summarizer_input = {
             "subject": subject,
             "sender": sender,
             "payload": {"body": {"data": full_body}}
         }
-
-        # *** Use the summarizer from summarizer.py (single argument) ***
         summary_reply = openai_summary_and_reply(summarizer_input)
-        
         try:
             summary_reply_parsed = json.loads(summary_reply)
         except Exception:
@@ -308,7 +262,6 @@ def fetch_important_full_emails(user_email: str):
         })
     
     return JSONResponse(content={"important_emails": important_emails})
-
 
 def get_gmail_service(access_token: str, refresh_token: str):
     creds = Credentials(
@@ -344,9 +297,6 @@ def decode_base64(data):
     decoded_bytes = base64.urlsafe_b64decode(data)
     return decoded_bytes.decode("utf-8", errors="replace")
 
-
-# If you had a local openai_summary_and_reply function here, remove it entirely!
-
 def get_user_profile(access_token: str, refresh_token: str):
     creds = Credentials(
         token=access_token,
@@ -365,3 +315,36 @@ def get_user_profile(access_token: str, refresh_token: str):
     if "names" in profile and profile["names"]:
         display_name = profile["names"][0].get("displayName")
     return display_name
+
+@app.get("/emails/grouped_summary")
+def get_grouped_summary(user_email: str):
+    """
+    1. Retrieve the important emails (using fetch_important_full_emails).
+    2. Convert them into the format required by group_emails_by_llm:
+       each item must have 'subject', 'sender', 'summary', 'time', 'suggested_reply'.
+    3. Call group_emails_by_llm and return the result as plain text.
+    """
+    response = fetch_important_full_emails(user_email)
+    try:
+        # Decode response body from bytes to string then load as JSON
+        data_dict = json.loads(response.body.decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse JSONResponse body: {str(e)}")
+    
+    if "important_emails" not in data_dict:
+        raise HTTPException(status_code=500, detail="No important emails found.")
+    
+    raw_emails = data_dict["important_emails"]
+    important_emails_data = []
+    for item in raw_emails:
+        summary_info = item.get("summary_info", {})
+        important_emails_data.append({
+            "subject": item.get("subject", ""),
+            "sender": item.get("sender", ""),
+            "summary": summary_info.get("summary", ""),
+            "time": "Unknown",  # Use actual timestamp if available
+            "suggested_reply": summary_info.get("suggested_reply", "")
+        })
+    
+    grouped_output = group_emails_by_llm(important_emails_data)
+    return PlainTextResponse(content=grouped_output)
