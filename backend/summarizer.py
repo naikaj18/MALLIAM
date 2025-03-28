@@ -2,6 +2,7 @@ import os
 import openai
 from dotenv import load_dotenv
 import json
+import re
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -9,13 +10,13 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 def openai_summary_and_reply(email_content):
     """
     Given an email content dictionary with keys "subject", "sender", and a body located in email_content['payload']['body']['data'],
-    this function uses the LLM to generate a concise summary of the email.
-    It will only provide a suggested reply if:
-      1. The sender appears to be a personal email (i.e. not a generic or automated company address).
-      2. The email asks a question or clearly requires a reply.
-    Otherwise, 'suggested_reply' is set to an empty string.
+    this function uses the LLM to generate a concise summary of the email in less than 120 words.
+    It will only provide a suggested reply if the email clearly demands a reply (for example, if it asks a question or requests a response).
+    Otherwise, it returns an empty string for 'suggested_reply'.
     
     The function returns the LLM's response as a JSON string with exactly two keys: 'summary' and 'suggested_reply'.
+    If the model embeds the suggested reply within the summary (after "Suggested reply:"), this function extracts that part 
+    using regex and assigns it to the 'suggested_reply' field, cleaning up the summary.
     """
     subject = email_content.get("subject", "")
     sender = email_content.get("sender", "")
@@ -29,10 +30,7 @@ def openai_summary_and_reply(email_content):
         f"Subject: {subject}\n"
         f"Sender: {sender}\n"
         f"Body: {body}\n\n"
-        "Please provide a concise summary of the email. "
-        "Only if the sender appears to be a personal email (i.e. not a generic company or automated address) "
-        "and if the email asks a question or clearly requires a response, provide a suggested professional reply. "
-        "If not, set 'suggested_reply' to an empty string. "
+        "Generate a concise summary of the email in less than 120 words. "
         "Return your result as a valid JSON object with exactly two keys: 'summary' and 'suggested_reply'."
     )
     
@@ -42,4 +40,24 @@ def openai_summary_and_reply(email_content):
         temperature=0.5
     )
     
-    return response.choices[0].message['content']
+    raw_output = response.choices[0].message['content']
+    
+    try:
+        result = json.loads(raw_output)
+    except Exception:
+        # If output isn't valid JSON, return it as is
+        return raw_output
+    
+    # Use regex to extract suggested reply if it's embedded in summary.
+    # Look for "Suggested reply:" (case-insensitive)
+    summary_text = result.get("summary", "")
+    if not result.get("suggested_reply"):
+        match = re.search(r"Suggested reply:\s*(.+)", summary_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            reply = match.group(1).strip()
+            # Remove the suggested reply part from summary
+            summary_clean = re.sub(r"Suggested reply:\s*.+", "", summary_text, flags=re.IGNORECASE | re.DOTALL).strip()
+            result["summary"] = summary_clean
+            result["suggested_reply"] = reply
+
+    return json.dumps(result)

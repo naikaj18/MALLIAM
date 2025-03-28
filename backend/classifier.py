@@ -13,9 +13,10 @@ def classify_emails(emails_json, batch_size=10):
     
     The prompt instructs the LLM to:
       - Exclude any emails that are automated, promotional, or marketing in nature.
-      - Exclude job alerts (e.g., from LinkedIn Job Alerts, ZipRecruiter, etc.), career notifications, 
-        subscription newsletters, daily digests, and any emails offering discounts, deals, or offers.
-      - Return only the IDs of emails that are genuine personal or work-related communications requiring direct attention or action.
+      - Exclude emails that appear to be job alerts, subscription newsletters, daily digests,
+        or that contain keywords such as "sale", "offer", "discount", "promotion", "newsletter", or "digest".
+      - Return only the IDs of emails that are genuine personal or work-related communications 
+        requiring direct attention or action.
     
     Aggregates and returns all important email IDs as a JSON array string.
     """
@@ -25,6 +26,17 @@ def classify_emails(emails_json, batch_size=10):
     for i in range(0, len(emails_json), batch_size):
         batch = emails_json[i:i+batch_size]
         
+        # Optional pre-filter: discard emails whose subject or snippet contain common advertisement keywords
+        prefiltered = []
+        ad_keywords = ["sale", "offer", "discount", "promotion", "newsletter", "digest"]
+        for email in batch:
+            subject = email.get("subject", "").lower()
+            snippet = email.get("snippet", "").lower()
+            if any(keyword in subject or keyword in snippet for keyword in ad_keywords):
+                continue
+            prefiltered.append(email)
+        batch = prefiltered
+
         # Truncate fields to reduce token usage
         for email in batch:
             if 'subject' in email and email['subject']:
@@ -43,13 +55,13 @@ def classify_emails(emails_json, batch_size=10):
                     {
                         "role": "system",
                         "content": (
-                            "You are a no-nonsense email filter assistant. You are given a JSON array of emails, "
+                            "You are a no-nonsense email filter assistant. You are provided with a JSON array of emails, "
                             "where each email includes the fields 'id', 'subject', 'sender', and 'snippet'. "
-                            "Your task is to output only a valid JSON array of the IDs of emails that are truly important. "
-                            "Important emails are those that represent genuine personal or work-related communications requiring direct attention or action. "
-                            "Strictly exclude any emails that are automated, promotional, or marketing in nature. "
-                            "This includes, but is not limited to, emails that are job alerts (e.g. from LinkedIn, ZipRecruiter, or similar), "
-                            "career notifications, subscription newsletters, daily digests, and emails offering discounts, deals, or offers. "
+                            "Your task is to return only the IDs of emails that are genuinely important – that is, "
+                            "those that represent personal or work-related communications requiring direct attention or action. "
+                            "Exclude any emails that are automated, promotional, or marketing in nature. This includes emails that are job alerts, "
+                            "subscription newsletters, daily digests, or any messages containing keywords like 'sale', 'offer', 'discount', "
+                            "'promotion', 'newsletter', or 'digest'. "
                             "Return only a valid JSON array of email IDs with no extra commentary."
                         )
                     },
@@ -58,7 +70,7 @@ def classify_emails(emails_json, batch_size=10):
                         "content": f"Here are the emails: {batch_json_str}"
                     }
                 ],
-                temperature=0.3
+                temperature=0.4
             )
             content = response['choices'][0]['message']['content']
             if not content.strip():
