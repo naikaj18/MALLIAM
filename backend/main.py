@@ -17,13 +17,14 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
 
 load_dotenv()
 
 app = FastAPI()
 
 # Enable CORS for your frontend
-from fastapi.middleware.cors import CORSMiddleware
 origins = [
     "http://localhost:3000",
 ]
@@ -190,11 +191,11 @@ def fetch_important_full_emails(user_email: str):
 
     for msg in messages:
         try:
+            # Retrieve the full email instead of metadata so we get internalDate
             msg_data = service.users().messages().get(
                 userId="me",
                 id=msg["id"],
-                format="metadata",
-                metadataHeaders=["Subject", "From"]
+                format="full"
             ).execute()
         except Exception:
             continue
@@ -206,12 +207,20 @@ def fetch_important_full_emails(user_email: str):
         if "IMPORTANT" in label_ids:
             gmail_important_ids.add(msg["id"])
         body_preview = extract_plain_text_body(msg_data.get("payload", {}))
+        # Extract internalDate and convert it
+        internal_date = msg_data.get("internalDate")
+        if internal_date:
+            time_str = datetime.fromtimestamp(int(internal_date) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            time_str = "Unknown"
+            
         emails_data.append({
             "id": msg["id"],
             "subject": subject,
             "sender": sender,
             "snippet": snippet,
-            "body": body_preview
+            "body": body_preview,
+            "time": time_str
         })
 
     classifier_result = classify_emails(emails_data)
@@ -258,7 +267,8 @@ def fetch_important_full_emails(user_email: str):
             "sender": sender,
             "snippet": meta.get("snippet"),
             "full_body": full_body,
-            "summary_info": summary_reply_parsed
+            "summary_info": summary_reply_parsed,
+            "time": meta.get("time", "Unknown")
         })
     
     return JSONResponse(content={"important_emails": important_emails})
@@ -319,14 +329,13 @@ def get_user_profile(access_token: str, refresh_token: str):
 @app.get("/emails/grouped_summary")
 def get_grouped_summary(user_email: str):
     """
-    1. Retrieve the important emails (using fetch_important_full_emails).
+    1. Retrieve the important emails using fetch_important_full_emails.
     2. Convert them into the format required by group_emails_by_llm:
-       each item must have 'subject', 'sender', 'summary', 'time', 'suggested_reply'.
+       each item must have 'subject', 'sender', 'summary', 'time', and 'suggested_reply'.
     3. Call group_emails_by_llm and return the result as plain text.
     """
     response = fetch_important_full_emails(user_email)
     try:
-        # Decode response body from bytes to string then load as JSON
         data_dict = json.loads(response.body.decode("utf-8"))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse JSONResponse body: {str(e)}")
@@ -342,7 +351,7 @@ def get_grouped_summary(user_email: str):
             "subject": item.get("subject", ""),
             "sender": item.get("sender", ""),
             "summary": summary_info.get("summary", ""),
-            "time": "Unknown",  # Use actual timestamp if available
+            "time": item.get("time", "Unknown"),
             "suggested_reply": summary_info.get("suggested_reply", "")
         })
     
